@@ -38,5 +38,11 @@ My goal is to provide objective, transparent data that anyone — activists, pol
 
 I’d love to see:
 - Additional layers of analysis, such as affordability or eviction data.
-- Collaborations that help validate assumptions and refine the rent-control c
+- Collaborations that help validate assumptions and refine the rent-control classification logic.
+- Possible exploration into the data across the assessor's defined districts
+- Broader use of this dataset in public meetings, op-eds, or advocacy.
+
+----
+**Author:** Mahal montes
+**License:** MIT 
 
