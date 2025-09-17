@@ -1,0 +1,665 @@
+---
+title: "SF Rent Control Database"
+author: "Mahal Montes"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(scales)
+library(gt)
+```
+
+## 1. Read in Data
+
+I'm only using two csv files.
+
+1. The first was taken from dataSF after searching their open portal for "Assessor Historical Secured Property Tax Rolls." This will be our main umbrella data set of housing parcels. https://data.sfgov.org/Housing-and-Buildings/Assessor-Historical-Secured-Property-Tax-Rolls/wv5m-vpq2/about_data
+
+2. The second was taken from the San Francisco Board of Supervisor's website that included the last amendment to the family plan (7/29/2025). The file was originally a pdf listed under the name "Parcel Tables 081525". https://sfgov.legistar.com/LegislationDetail.aspx?GUID=0F95C63F-86D3-433A-8B92-069CAB240942&ID=7449404&Options=ID%7CText%7C&Search=250700 
+
+```{r, echo=FALSE}
+lot_table_raw <-  read.csv("Data/Raw/lots.csv", header = T, as.is = F)
+
+# read in parcels
+parcel_table_raw <- read.csv("Data/Raw/Parcels.csv", header = T)
+```
+
+## 2. Clean the Data
+1. I started by keeping only 12 columns in the Assessor's big database of parcel data. In the same data frame, I filtered out all the property class codes that obviously are not part of the housing stock.  
+
+2. Then, I parsed the height approvals in a table called "lot_table" and also making a parcel number id, which the original data did not contain.
+
+
+
+```{r, echo=FALSE}
+# Keep only main columns and possible columns for future use
+parcel_table <- parcel_table_raw |>
+  select(Parcel.Number, Block, Lot, Year.Property.Built, Number.of.Units, Property.Area, 
+         Assessor.Neighborhood.District, Supervisor.District, Closed.Roll.Year, Use.Definition,
+         Property.Class.Code.Definition, Exemption.Code.Definition) |>
+  # Filter to exclude only obviously non-housing properties
+  dplyr::filter(
+    # Use regex to exclude non-housing property types
+    !grepl(paste0(
+      # Vacant / undeveloped / special categories
+      "(?i)Vacant|Under Water Lot|Possessory Interest|PUD|",
+      # Civic / institutional / public properties  
+      "Schools|Churches|Public Buildings|University of California|City Property|State of California|",
+      "Port Commission|Redevelopment Agency|Consulate|FIRE STATION|POLICE STATION|LIBRARY|Hospitals(?! and Apartments)|U\\.S\\. Government|",
+      # Commercial / office / industrial / parking (with gov variants)
+      "Commercial(?!.*(Apartment|and Apartments))|Shopping Center|Medical- dental Office|",
+      "Office(?!.*(and Apartments|Apartments))|Industrial(?! Condominium)|GARAGE(?! Condominium)|Parking|Bank(?! Condominium)|",
+      "Entertainment Complex|Theatres|Golf Course|Mission Bay|Gas Station|",
+      # Clubs and social organizations
+      "Clubs|Lodges|Fraternal|",
+      # Transient lodging / timeshare
+      "Hotel|Motel|Time Share|Timeshare|",
+      # Non-residential condominiums  
+      "Commercial.*Condo|Office.*Condominium|Industrial Condominium|Garage Condominium|Parking.*Condominium|Bank Condominium"
+    ), Property.Class.Code.Definition, perl = TRUE)
+  ) |>
+  # Ensure we keep the most recent roll year for each parcel
+  arrange(Parcel.Number, desc(Closed.Roll.Year)) |>
+  distinct(Parcel.Number, .keep_all = TRUE) |>
+  # Clean data formatting
+  mutate(
+    # Convert Number.of.Units to integer (remove commas first)
+    Number.of.Units = as.integer(gsub(",", "", Number.of.Units)),
+    # Set condos to 1 unit per row
+    Number.of.Units = case_when(
+      grepl("Condominium", Property.Class.Code.Definition, ignore.case = TRUE) ~ 1L,
+      TRUE ~ Number.of.Units
+    ),
+  ) |>
+  # Filter to keep only rows with units after condo adjustment
+  dplyr::filter(Number.of.Units > 0) |>
+  # Final check: ensure all parcel numbers are unique
+  distinct(Parcel.Number, .keep_all = TRUE)
+
+# clean up the lot and block data for the lot table
+lot_table <- lot_table_raw |>
+  mutate(
+    Block4 = sprintf("%04d", as.integer(gsub("\\D", "", Block))), # 4-digit BLOCK (keeps only digits, pads to 4)
+    Lot3   = paste0(
+               sprintf("%03d", as.integer(sub("\\D.*", "", Lot))),
+               toupper(sub("^[0-9]+", "", Lot))
+             ), # 3-digit LOT + optional letter suffix (pads digits, keeps suffix)
+    Parcel.Number = paste0(Block4, Lot3),  # APNs! 
+    
+    # Parse height data
+    # Extract numeric value from old height (Height_Bulk_Superseded)
+    old_height = as.numeric(gsub("[^0-9]", "", Height_Bulk_Superseded)),
+    
+    # Parse new height from Height_Bulk_Approved (before //)
+    new_height_rezoning = case_when(
+      grepl("//", Height_Bulk_Approved) ~ as.numeric(gsub("[^0-9].*", "", Height_Bulk_Approved)),
+      TRUE ~ as.numeric(gsub("[^0-9]", "", Height_Bulk_Approved))
+    ),
+    
+    # Parse bonus height from Height_Bulk_Approved (after //)
+    new_height_housing_choice = case_when(
+      grepl("//", Height_Bulk_Approved) & grepl("//[0-9]+", Height_Bulk_Approved) ~ {
+        after_slash <- gsub(".*//", "", Height_Bulk_Approved)
+        numeric_part <- gsub("([0-9]+).*", "\\1", after_slash)
+        suppressWarnings(as.numeric(numeric_part))
+      },
+      TRUE ~ NA_real_
+    ),
+    
+    # Create increase indicators
+    height_increase_rezoning = !is.na(old_height) & !is.na(new_height_rezoning) & 
+                              new_height_rezoning > old_height,
+    
+    height_increase_housing_choice = !is.na(old_height) & !is.na(new_height_housing_choice) & 
+                                    new_height_housing_choice > old_height
+  ) |>
+  # Select only the columns we need
+  select(Parcel.Number, old_height, new_height_rezoning, new_height_housing_choice, 
+         height_increase_rezoning, height_increase_housing_choice)
+
+
+
+
+write.csv(lot_table, "Data/Processed/lots_clean.csv", row.names = FALSE)
+write.csv(parcel_table, "Data/Processed/parcels_clean.csv", row.names = FALSE)
+
+```
+
+## 3. Create Comprehensive Housing Database
+
+For sanity, I checked the total number of housing properties and units. The numbers match up with dataSF's latest estimates in the 2023 report. Note that the numbers in the 2023 report are based on 2020 numbers: https://sfplanning.org/sites/default/files/resources/2024-04/2023_Housing_Inventory.pdf?utm. 
+
+```{r, echo=FALSE}
+# merge all datasets to create comprehensive housing database
+all_housing_data <- parcel_table |>
+  # merge with lot data for height analysis
+  left_join(lot_table, by = "Parcel.Number")
+
+
+print(paste("Total housing properties in dataset:", nrow(all_housing_data)))
+print(paste("Total housing units in dataset:", sum(all_housing_data$Number.of.Units, na.rm = TRUE)))
+```
+
+Then, I made the rent control database by excluding single family homes, properties built after June 13, 1979, below market rate housing, and other institutional forms of housing like nursing homes, SROs, and government apartments. 
+
+```{r, echo=FALSE}
+# Create rent control exclusions dataset
+rent_control <- all_housing_data |>
+  mutate(
+    # 1. Single Family Homes - typically not rent controlled
+    Single_family = grepl("Single Family", Property.Class.Code.Definition, ignore.case = TRUE) |
+                           Property.Class.Code.Definition == "Legal Multi-Family Con to SFR" |
+                           (Property.Class.Code.Definition == "Dwelling" & Number.of.Units == 1) |
+                           (Property.Class.Code.Definition == "Single Struct on Multi Lot (D & F's only)" & Number.of.Units == 1),
+    
+    # 2. Properties built after June 13, 1979 are not rent controlled
+    Built_after_1979 = !is.na(Year.Property.Built) & Year.Property.Built > 1979,
+    
+    
+    # 4. Condos (residential) - not rent controlled
+    Condo = grepl("Condominium(?!.*BMR)|Live/Work Condominium(?!.*BMR)", Property.Class.Code.Definition, perl = TRUE),
+    
+    # 5. BMR (deed-restricted) housing - not rent controlled
+    BMR = grepl("BMR", Property.Class.Code.Definition, ignore.case = TRUE),
+    
+    # 6. Institutional care facilities (including government) - not rent controlled
+    Institutional = grepl("Convalescent/Nursing Homes|Apartment Gov|Residential Hotel & SRO Gov", Property.Class.Code.Definition),
+    
+    # Create final rent control variable
+    # A property IS rent controlled if it meets NONE of the exclusion criteria
+    Rent_controlled = !(Single_family | Built_after_1979 | 
+                          Condo | BMR | Institutional),
+    
+    # Handle NA values - if we can't determine, assume not rent controlled (conservative approach)
+    Rent_controlled = case_when(
+      is.na(Rent_controlled) ~ FALSE,
+      TRUE ~ Rent_controlled
+    )
+  )
+
+# Create rent control summary
+exclusion_stats <- rent_control |>
+  summarise(
+    total_properties = n(),
+    total_units = sum(Number.of.Units, na.rm = TRUE),
+    rent_controlled_properties = sum(Rent_controlled, na.rm = TRUE),
+    rent_controlled_units = sum(Number.of.Units[Rent_controlled], na.rm = TRUE),
+    
+    # Count excluded properties by category
+    properties_excluded_single_family = sum(Single_family, na.rm = TRUE),
+    properties_excluded_built_after_1979 = sum(Built_after_1979, na.rm = TRUE),
+    properties_excluded_condo = sum(Condo, na.rm = TRUE),
+    properties_excluded_bmr = sum(BMR, na.rm = TRUE),
+    properties_excluded_institutional = sum(Institutional, na.rm = TRUE),
+    
+    # Count excluded units by category
+    units_excluded_single_family = sum(Number.of.Units[Single_family], na.rm = TRUE),
+    units_excluded_built_after_1979 = sum(Number.of.Units[Built_after_1979], na.rm = TRUE),
+    units_excluded_condo = sum(Number.of.Units[Condo], na.rm = TRUE),
+    units_excluded_bmr = sum(Number.of.Units[BMR], na.rm = TRUE),
+    units_excluded_institutional = sum(Number.of.Units[Institutional], na.rm = TRUE)
+  )
+
+# Create exclusion summary table
+exclusion_categories <- c("Single Family", "Built After 1979", 
+                         "Condos", "BMR Housing", "Institutional")
+properties_excluded <- c(exclusion_stats$properties_excluded_single_family,
+                        exclusion_stats$properties_excluded_built_after_1979,
+                        exclusion_stats$properties_excluded_condo,
+                        exclusion_stats$properties_excluded_bmr,
+                        exclusion_stats$properties_excluded_institutional)
+units_excluded <- c(exclusion_stats$units_excluded_single_family,
+                   exclusion_stats$units_excluded_built_after_1979,
+                   exclusion_stats$units_excluded_condo,
+                   exclusion_stats$units_excluded_bmr,
+                   exclusion_stats$units_excluded_institutional)
+
+# Create summary table
+exclusion_summary <- data.frame(
+  Category = exclusion_categories,
+  Properties = properties_excluded,
+  Units = units_excluded
+)
+exclusion_summary_t <- t(exclusion_summary)
+colnames(exclusion_summary_t) <- exclusion_summary_t[1,]
+exclusion_summary_t <- exclusion_summary_t[-1,]
+
+# Exclusion Summary by Category
+print(exclusion_summary_t)
+
+# Create rent control summary table
+rent_control_summary <- data.frame(
+  Status = c("Rent Controlled", "Not Rent Controlled"),
+  Properties = c(exclusion_stats$rent_controlled_properties, 
+                exclusion_stats$total_properties - exclusion_stats$rent_controlled_properties),
+  Units = c(exclusion_stats$rent_controlled_units,
+           exclusion_stats$total_units - exclusion_stats$rent_controlled_units)
+) |>
+  mutate(
+    Percentage_Properties = round((Properties / exclusion_stats$total_properties) * 100, 1),
+    Percentage_Units = round((Units / exclusion_stats$total_units) * 100, 1)
+  )
+
+# Rent Control Summary
+print(rent_control_summary)
+
+
+```
+
+## 4. Visualized Rent Control under the Family Zoning Plan
+
+I created an overall summary of rent controlled units and properties that are subject to the rezoning plan. The metrics are counts of units/properties and the percentage of rezoned rent controlled units out of the entire rent control stock. 
+
+```{r, echo=FALSE}
+# Filter to rent controlled properties and analyze height increases
+rent_controlled_height_analysis <- rent_control |>
+  filter(Rent_controlled == TRUE)
+
+# Overall totals
+overall_totals <- rent_controlled_height_analysis |>
+  summarise(
+    total_rc_units = sum(Number.of.Units, na.rm = TRUE),
+    units_eligible_rezoning = sum(Number.of.Units[height_increase_rezoning == TRUE], na.rm = TRUE),
+    units_eligible_housing_choice = sum(Number.of.Units[height_increase_housing_choice == TRUE], na.rm = TRUE)
+  ) |>
+  mutate(
+    percentage_eligible_rezoning = round((units_eligible_rezoning / total_rc_units) * 100, 1),
+    percentage_eligible_housing_choice = round((units_eligible_housing_choice / total_rc_units) * 100, 1)
+  )
+
+# Restructure overall totals for better readability
+overall_summary <- data.frame(
+  Metric = c("Units", "Percentage"),
+  Total_RC_Units = c(overall_totals$total_rc_units, ""),
+  Eligible_Rezoning = c(overall_totals$units_eligible_rezoning, paste0(overall_totals$percentage_eligible_rezoning, "%")),
+  Eligible_Housing_Choice = c(overall_totals$units_eligible_housing_choice, paste0(overall_totals$percentage_eligible_housing_choice, "%"))
+)
+
+#Overall Rent Controlled Units Eligible for Height Increases
+print(overall_summary)
+
+# Visualization for overall totals - Enhanced with percentages
+overall_viz_data <- data.frame(
+  Category = c("Eligible Rezoning", "Eligible Housing Choice"),
+  Units = c(overall_totals$units_eligible_rezoning, overall_totals$units_eligible_housing_choice),
+  Percentage = c(overall_totals$percentage_eligible_rezoning, overall_totals$percentage_eligible_housing_choice),
+  Total_RC_Units = c(overall_totals$total_rc_units, overall_totals$total_rc_units)
+)
+
+# Create dual-axis plot showing both units and percentages
+overall_plot <- ggplot(overall_viz_data, aes(x = Category)) +
+  geom_bar(aes(y = Units, fill = Category), stat = "identity", alpha = 0.7) +
+  geom_text(aes(y = Units, label = paste0(scales::comma(Units), " units\n(", Percentage, "%)")), 
+            vjust = -0.3, size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Eligible Rezoning" = "#e74c3c", "Eligible Housing Choice" = "#f39c12")) +
+  labs(title = "Rent Controlled Units Eligible for Height Increases",
+       subtitle = paste0("Out of ", scales::comma(overall_totals$total_rc_units), " total rent controlled units"),
+       x = "Eligibility Category", y = "Number of Units") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12)) +
+  scale_y_continuous(labels = scales::comma, 
+                     limits = c(0, max(overall_viz_data$Units) * 1.2))
+
+print(overall_plot)
+
+# Create a percentage comparison plot
+percentage_plot <- ggplot(overall_viz_data, aes(x = Category, y = Percentage, fill = Category)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = paste0(Percentage, "%")), vjust = -0.3, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("Eligible Rezoning" = "#e74c3c", "Eligible Housing Choice" = "#f39c12")) +
+  labs(title = "Percentage of Rent Controlled Units Eligible for Height Increases",
+       x = "Eligibility Category", y = "Percentage of RC Units") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 14, face = "bold")) +
+  scale_y_continuous(limits = c(0, max(overall_viz_data$Percentage) * 1.2))
+
+print(percentage_plot)
+```
+
+### Extending the Analysis to Supervisor Districts
+Voters I spoke to are concerned about changes to their specific district, so this section includes data separated by supervisor district. I calculated the number of rent controlled units that exist in each district in total and the number of units eligible to housing increases under the base rezoning plan as well as the housing choice program height boost. 
+
+Then, I explored the percentages rent control (RC) units that are eligible for rezoning.
+
+```{r, echo=FALSE}
+# By Supervisor District
+by_supervisor <- rent_controlled_height_analysis |>
+  group_by(Supervisor.District) |>
+  summarise(
+    total_rc_units = sum(Number.of.Units, na.rm = TRUE),
+    units_eligible_rezoning = sum(Number.of.Units[height_increase_rezoning == TRUE], na.rm = TRUE),
+    units_eligible_housing_choice = sum(Number.of.Units[height_increase_housing_choice == TRUE], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    percentage_eligible_rezoning = round((units_eligible_rezoning / total_rc_units) * 100, 1),
+    percentage_eligible_housing_choice = round((units_eligible_housing_choice / total_rc_units) * 100, 1)
+  ) |>
+  arrange(Supervisor.District) |>
+  filter(!is.na(Supervisor.District))
+
+print(unit <- by_supervisor |> select(total_rc_units, units_eligible_rezoning, units_eligible_housing_choice))
+print(pct <- by_supervisor |> select(percentage_eligible_rezoning, percentage_eligible_housing_choice))
+
+
+# Supervisor District Visualization - Percentages Only
+supervisor_viz_data <- by_supervisor |>
+  select(Supervisor.District, percentage_eligible_rezoning, percentage_eligible_housing_choice) |>
+  tidyr::gather(key = "Eligibility_Type", value = "Percentage", 
+                percentage_eligible_rezoning, percentage_eligible_housing_choice) |>
+  mutate(
+    Eligibility_Type = case_when(
+      Eligibility_Type == "percentage_eligible_rezoning" ~ "Rezoning",
+      Eligibility_Type == "percentage_eligible_housing_choice" ~ "Housing Choice"
+    )
+  ) |>
+  filter(!is.na(Supervisor.District) & !is.na(Percentage))
+
+# Percentage plot for supervisor districts
+supervisor_percentage_plot <- ggplot(supervisor_viz_data, aes(x = reorder(as.factor(Supervisor.District), Percentage), 
+                                                              y = Percentage, fill = Eligibility_Type)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), 
+            position = position_dodge(width = 0.9), hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(title = "Percentage of RC Units Eligible by Supervisor District",
+       x = "Supervisor District", y = "Percentage of District's RC Units", fill = "Eligibility Type") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Rezoning" = "#e74c3c", "Housing Choice" = "#f39c12")) +
+  scale_y_continuous(limits = c(0, max(supervisor_viz_data$Percentage, na.rm = TRUE) * 1.2))
+
+print(supervisor_percentage_plot)
+```
+
+### Rent Control Composition Analysis
+```{r}
+# Analyze what percentage of height-eligible properties are rent controlled
+height_eligible_composition <- rent_control |>
+  summarise(
+    # Rezoning eligibility
+    total_eligible_rezoning_properties = sum(height_increase_rezoning == TRUE, na.rm = TRUE),
+    total_eligible_rezoning_units = sum(Number.of.Units[height_increase_rezoning == TRUE], na.rm = TRUE),
+    rc_eligible_rezoning_properties = sum(height_increase_rezoning == TRUE & Rent_controlled == TRUE, na.rm = TRUE),
+    rc_eligible_rezoning_units = sum(Number.of.Units[height_increase_rezoning == TRUE & Rent_controlled == TRUE], na.rm = TRUE),
+    
+    # Housing Choice eligibility  
+    total_eligible_housing_choice_properties = sum(height_increase_housing_choice == TRUE, na.rm = TRUE),
+    total_eligible_housing_choice_units = sum(Number.of.Units[height_increase_housing_choice == TRUE], na.rm = TRUE),
+    rc_eligible_housing_choice_properties = sum(height_increase_housing_choice == TRUE & Rent_controlled == TRUE, na.rm = TRUE),
+    rc_eligible_housing_choice_units = sum(Number.of.Units[height_increase_housing_choice == TRUE & Rent_controlled == TRUE], na.rm = TRUE)
+  ) |>
+  mutate(
+    # Calculate percentages
+    pct_rc_properties_rezoning = round((rc_eligible_rezoning_properties / total_eligible_rezoning_properties) * 100, 1),
+    pct_rc_units_rezoning = round((rc_eligible_rezoning_units / total_eligible_rezoning_units) * 100, 1),
+    pct_rc_properties_housing_choice = round((rc_eligible_housing_choice_properties / total_eligible_housing_choice_properties) * 100, 1),
+    pct_rc_units_housing_choice = round((rc_eligible_housing_choice_units / total_eligible_housing_choice_units) * 100, 1)
+  )
+
+# Create summary table
+composition_summary <- data.frame(
+  Program = c("Rezoning Plan", "Housing Choice Program"),
+  Total_Eligible_Properties = c(height_eligible_composition$total_eligible_rezoning_properties,
+                               height_eligible_composition$total_eligible_housing_choice_properties),
+  RC_Properties = c(height_eligible_composition$rc_eligible_rezoning_properties,
+                   height_eligible_composition$rc_eligible_housing_choice_properties),
+  Pct_RC_Properties = c(height_eligible_composition$pct_rc_properties_rezoning,
+                       height_eligible_composition$pct_rc_properties_housing_choice),
+  Total_Eligible_Units = c(height_eligible_composition$total_eligible_rezoning_units,
+                          height_eligible_composition$total_eligible_housing_choice_units),
+  RC_Units = c(height_eligible_composition$rc_eligible_rezoning_units,
+              height_eligible_composition$rc_eligible_housing_choice_units),
+  Pct_RC_Units = c(height_eligible_composition$pct_rc_units_rezoning,
+                  height_eligible_composition$pct_rc_units_housing_choice)
+)
+
+print("Rent Control Composition Among Height-Eligible Properties:")
+print(composition_summary)
+
+# Create visualization data
+composition_viz_data <- data.frame(
+  Program = rep(c("Rezoning Plan", "Housing Choice Program"), 2),
+  Metric = c(rep("Properties", 2), rep("Units", 2)),
+  RC_Percentage = c(height_eligible_composition$pct_rc_properties_rezoning,
+                   height_eligible_composition$pct_rc_properties_housing_choice,
+                   height_eligible_composition$pct_rc_units_rezoning,
+                   height_eligible_composition$pct_rc_units_housing_choice),
+  Non_RC_Percentage = c(100 - height_eligible_composition$pct_rc_properties_rezoning,
+                       100 - height_eligible_composition$pct_rc_properties_housing_choice,
+                       100 - height_eligible_composition$pct_rc_units_rezoning,
+                       100 - height_eligible_composition$pct_rc_units_housing_choice)
+) |>
+  tidyr::gather(key = "Control_Status", value = "Percentage", RC_Percentage, Non_RC_Percentage) |>
+  mutate(
+    Control_Status = case_when(
+      Control_Status == "RC_Percentage" ~ "Rent Controlled",
+      Control_Status == "Non_RC_Percentage" ~ "Not Rent Controlled"
+    )
+  )
+
+# Create stacked bar chart showing rent control composition
+composition_plot <- ggplot(composition_viz_data, aes(x = Program, y = Percentage, fill = Control_Status)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = ifelse(Control_Status == "Rent Controlled", 
+                              paste0(round(Percentage, 1), "%"), "")), 
+            position = position_stack(vjust = 0.5), size = 3.5, fontface = "bold") +
+  facet_wrap(~Metric, ncol = 2) +
+  scale_fill_manual(values = c("Rent Controlled" = "#3498db", "Not Rent Controlled" = "#95a5a6")) +
+  labs(title = "Rent Control Composition of Height-Eligible Properties",
+       subtitle = "Percentage breakdown of properties/units eligible for height increases",
+       x = "Program", y = "Percentage", fill = "Status") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12)) +
+  scale_y_continuous(limits = c(0, 100))
+
+print(composition_plot)
+
+# Rent Control Composition by Supervisor District
+district_composition <- rent_control |>
+  filter(!is.na(Supervisor.District)) |>
+  group_by(Supervisor.District) |>
+  summarise(
+    # Rezoning eligibility
+    total_eligible_rezoning_properties = sum(height_increase_rezoning == TRUE, na.rm = TRUE),
+    total_eligible_rezoning_units = sum(Number.of.Units[height_increase_rezoning == TRUE], na.rm = TRUE),
+    rc_eligible_rezoning_properties = sum(height_increase_rezoning == TRUE & Rent_controlled == TRUE, na.rm = TRUE),
+    rc_eligible_rezoning_units = sum(Number.of.Units[height_increase_rezoning == TRUE & Rent_controlled == TRUE], na.rm = TRUE),
+    
+    # Housing Choice eligibility  
+    total_eligible_housing_choice_properties = sum(height_increase_housing_choice == TRUE, na.rm = TRUE),
+    total_eligible_housing_choice_units = sum(Number.of.Units[height_increase_housing_choice == TRUE], na.rm = TRUE),
+    rc_eligible_housing_choice_properties = sum(height_increase_housing_choice == TRUE & Rent_controlled == TRUE, na.rm = TRUE),
+    rc_eligible_housing_choice_units = sum(Number.of.Units[height_increase_housing_choice == TRUE & Rent_controlled == TRUE], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    # Calculate percentages
+    pct_rc_properties_rezoning = round((rc_eligible_rezoning_properties / total_eligible_rezoning_properties) * 100, 1),
+    pct_rc_units_rezoning = round((rc_eligible_rezoning_units / total_eligible_rezoning_units) * 100, 1),
+    pct_rc_properties_housing_choice = round((rc_eligible_housing_choice_properties / total_eligible_housing_choice_properties) * 100, 1),
+    pct_rc_units_housing_choice = round((rc_eligible_housing_choice_units / total_eligible_housing_choice_units) * 100, 1)
+  ) |>
+  # Filter out districts with no eligible properties
+  filter(total_eligible_rezoning_properties > 0 | total_eligible_housing_choice_properties > 0)
+
+print("Rent Control Composition by Supervisor District:")
+print(district_composition)
+
+# Create visualization data for districts
+district_viz_data <- district_composition |>
+  select(Supervisor.District, pct_rc_properties_rezoning, pct_rc_properties_housing_choice,
+         pct_rc_units_rezoning, pct_rc_units_housing_choice) |>
+  tidyr::gather(key = "Metric_Type", value = "RC_Percentage", -Supervisor.District) |>
+  mutate(
+    Program = case_when(
+      grepl("rezoning", Metric_Type) ~ "Rezoning Plan",
+      grepl("housing_choice", Metric_Type) ~ "Housing Choice Program"
+    ),
+    Metric = case_when(
+      grepl("properties", Metric_Type) ~ "Properties",
+      grepl("units", Metric_Type) ~ "Units"
+    ),
+    Non_RC_Percentage = 100 - RC_Percentage
+  ) |>
+  filter(!is.na(RC_Percentage) & !is.infinite(RC_Percentage)) |>
+  tidyr::gather(key = "Control_Status", value = "Percentage", RC_Percentage, Non_RC_Percentage) |>
+  mutate(
+    Control_Status = case_when(
+      Control_Status == "RC_Percentage" ~ "Rent Controlled",
+      Control_Status == "Non_RC_Percentage" ~ "Not Rent Controlled"
+    )
+  )
+
+# Create separate, cleaner plots for properties and units
+# Properties plot
+properties_viz_data <- district_viz_data |>
+  filter(Metric == "Properties")
+
+district_properties_plot <- ggplot(properties_viz_data, aes(x = Program, y = Percentage, fill = Control_Status)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = ifelse(Control_Status == "Rent Controlled", 
+                              paste0(round(Percentage, 1), "%"), "")), 
+            position = position_stack(vjust = 0.5), size = 3, fontface = "bold") +
+  facet_wrap(~Supervisor.District, ncol = 3, labeller = label_both) +
+  scale_fill_manual(values = c("Rent Controlled" = "#3498db", "Not Rent Controlled" = "#95a5a6")) +
+  labs(title = "Rent Control Composition by Supervisor District - Properties",
+       subtitle = "Percentage of height-eligible properties that are rent controlled",
+       x = "Program", y = "Percentage", fill = "Status") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 10)) +
+  scale_y_continuous(limits = c(0, 100))
+
+print(district_properties_plot)
+
+# Units plot
+units_viz_data <- district_viz_data |>
+  filter(Metric == "Units")
+
+district_units_plot <- ggplot(units_viz_data, aes(x = Program, y = Percentage, fill = Control_Status)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = ifelse(Control_Status == "Rent Controlled", 
+                              paste0(round(Percentage, 1), "%"), "")), 
+            position = position_stack(vjust = 0.5), size = 3, fontface = "bold") +
+  facet_wrap(~Supervisor.District, ncol = 3, labeller = label_both) +
+  scale_fill_manual(values = c("Rent Controlled" = "#3498db", "Not Rent Controlled" = "#95a5a6")) +
+  labs(title = "Rent Control Composition by Supervisor District - Units",
+       subtitle = "Percentage of height-eligible units that are rent controlled",
+       x = "Program", y = "Percentage", fill = "Status") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 10)) +
+  scale_y_continuous(limits = c(0, 100))
+
+print(district_units_plot)
+```
+
+## Analysis by Assessor District
+
+```{r}
+# By Assessor District  
+by_assessor <- rent_controlled_height_analysis |>
+  group_by(Assessor.Neighborhood.District) |>
+  summarise(
+    total_rc_units = sum(Number.of.Units, na.rm = TRUE),
+    units_eligible_rezoning = sum(Number.of.Units[height_increase_rezoning == TRUE], na.rm = TRUE),
+    units_eligible_housing_choice = sum(Number.of.Units[height_increase_housing_choice == TRUE], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    percentage_eligible_rezoning = round((units_eligible_rezoning / total_rc_units) * 100, 1),
+    percentage_eligible_housing_choice = round((units_eligible_housing_choice / total_rc_units) * 100, 1)
+  ) |>
+  arrange(desc(total_rc_units))
+
+print("Rent Controlled Units Eligible for Height Increases by Assessor District:")
+print(by_assessor)
+
+# MANOVA analysis for Assessor Districts
+# Create data for MANOVA - expand to unit level for proper analysis
+assessor_manova_data <- rent_controlled_height_analysis |>
+  filter(!is.na(Assessor.Neighborhood.District)) |>
+  select(Assessor.Neighborhood.District, height_increase_rezoning, height_increase_housing_choice) |>
+  mutate(
+    rezoning_eligible = as.numeric(height_increase_rezoning),
+    housing_choice_eligible = as.numeric(height_increase_housing_choice)
+  )
+
+# Perform MANOVA
+assessor_manova <- manova(cbind(rezoning_eligible, housing_choice_eligible) ~ Assessor.Neighborhood.District, 
+                         data = assessor_manova_data)
+
+print("MANOVA Results for Assessor Districts:")
+print(summary(assessor_manova))
+
+# Enhanced Visualization for Assessor Districts with percentages
+# Filter to top 10 districts by total units for readability
+top_assessor_districts <- by_assessor |>
+  slice_max(total_rc_units, n = 10)
+
+assessor_viz_data <- top_assessor_districts |>
+  select(Assessor.Neighborhood.District, units_eligible_rezoning, units_eligible_housing_choice,
+         percentage_eligible_rezoning, percentage_eligible_housing_choice, total_rc_units) |>
+  tidyr::gather(key = "Metric_Type", value = "Value", 
+                units_eligible_rezoning, units_eligible_housing_choice,
+                percentage_eligible_rezoning, percentage_eligible_housing_choice) |>
+  mutate(
+    Eligibility_Type = case_when(
+      grepl("rezoning", Metric_Type) ~ "Rezoning",
+      grepl("housing_choice", Metric_Type) ~ "Housing Choice"
+    ),
+    Data_Type = case_when(
+      grepl("units_", Metric_Type) ~ "Units",
+      grepl("percentage_", Metric_Type) ~ "Percentage"
+    )
+  ) |>
+  tidyr::spread(key = Data_Type, value = Value)
+
+# Units plot with percentage labels for assessor districts
+assessor_units_plot <- ggplot(assessor_viz_data, aes(x = reorder(Assessor.Neighborhood.District, Units), 
+                                                     y = Units, fill = Eligibility_Type)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(aes(label = paste0(scales::comma(Units), "\n(", round(Percentage, 1), "%)")), 
+            position = position_dodge(width = 0.9), hjust = -0.1, size = 2.5) +
+  coord_flip() +
+  labs(title = "Eligible RC Units by Top 10 Assessor Districts",
+       subtitle = "Numbers show units (percentage of district's RC units)",
+       x = "Assessor District", y = "Number of Units", fill = "Eligibility Type") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Rezoning" = "#27ae60", "Housing Choice" = "#8e44ad")) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.3))) +
+  theme(axis.text.y = element_text(size = 8))
+
+print(assessor_units_plot)
+
+# Percentage comparison plot for assessor districts
+assessor_percentage_plot <- ggplot(assessor_viz_data, aes(x = reorder(Assessor.Neighborhood.District, Percentage), 
+                                                          y = Percentage, fill = Eligibility_Type)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Percentage, 1), "%")), 
+            position = position_dodge(width = 0.9), hjust = -0.1, size = 2.5) +
+  coord_flip() +
+  labs(title = "Percentage of RC Units Eligible by Top 10 Assessor Districts",
+       x = "Assessor District", y = "Percentage of District's RC Units", fill = "Eligibility Type") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Rezoning" = "#27ae60", "Housing Choice" = "#8e44ad")) +
+  scale_y_continuous(limits = c(0, max(assessor_viz_data$Percentage, na.rm = TRUE) * 1.2)) +
+  theme(axis.text.y = element_text(size = 8))
+
+print(assessor_percentage_plot)
+```
+
